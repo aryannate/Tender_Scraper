@@ -27,6 +27,7 @@ import re
 import time
 from datetime import datetime
 from collections import deque
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -60,6 +61,7 @@ FIELDS = [
 FLOAT_FROM = datetime(2026, 1, 1)
 
 ERROR_FIELDS = ["source", "tender_id", "reason"]
+SOURCE_GROUP = ContextVar("source_group", default="")
 
 # The only valid tender categories. A tender's category is EXTRACTED from the
 # portal-supplied category value a scraper passes in `tender_type` (e.g. the
@@ -155,7 +157,8 @@ async def fetch(
                 await asyncio.sleep(delay)
             else:
                 raise RetryableError(f"{url} failed after "
-                                     f"{config.max_retries} retries: {exc!r}") from last_exc
+                                     f"{config.max_retries} retries: "
+                                     f"{type(exc).__name__}: {exc}") from last_exc
         finally:
             # Rate limit every attempt so retries also stay polite.
             await asyncio.sleep(config.rate_limit)
@@ -228,7 +231,7 @@ class ResultSink:
         # (and aren't a keyword-matching empanelment) are dropped.
         self.matcher = matcher
         # Empanelments must match the IT-domain empanelment keyword list.
-        self._emp_matcher = KeywordMatcher(EMPANELMENT_KEYWORDS)
+        self._emp_matcher = matcher or KeywordMatcher(EMPANELMENT_KEYWORDS)
         self.filtered_out = 0
         self.scanned = 0
         os.makedirs(config.out_dir, exist_ok=True)
@@ -236,6 +239,11 @@ class ResultSink:
         # dedup store keyed by (source, tender_id) -> row (only tenders that
         # PASSED the keyword filter, i.e. what ends up in the output CSV)
         self._rows: dict[tuple[str, str], dict[str, str]] = {}
+        # Fresh observations only; historical CSV rows never become alerts.
+        self._current_rows: dict[tuple[str, str], dict[str, str]] = {}
+        self.new_errors: list[dict[str, str]] = []
+        self.group_errors: dict[str, int] = {}
+        self.source_outcomes: dict[str, str] = {}
         self._errors: list[dict[str, str]] = []
         self._since_flush = 0
         self._lock = asyncio.Lock()
@@ -302,23 +310,32 @@ class ResultSink:
     def set_total(self, total: int) -> None:
         self.progress.set_total(total)
 
+    @property
+    def current_rows(self) -> list[dict[str, str]]:
+        return list(self._current_rows.values())
+
     @staticmethod
     def _is_newer(new: dict[str, str], existing: dict[str, str]) -> bool:
         """Keep-latest rule for corrigendums / re-listings."""
-        # An explicit corrigendum marker wins.
-        if new.get("corrigendum") and not existing.get("corrigendum"):
-            return True
-        # Otherwise prefer the later published date (lexicographic on ISO works;
-        # fall back to closing date, then to "keep existing").
-        for key in ("published_date", "closing_date"):
-            n, e = new.get(key, ""), existing.get(key, "")
-            if n and e and n != e:
-                return n > e
-        return False
+        # Prefer corrigenda and later dates within this run. A total-order
+        # tie break keeps concurrent keyword/page arrival order from generating
+        # false UPDATED notifications when the same variants reappear tomorrow.
+        def rank(row):
+            def date_rank(name):
+                value = row.get(name, "")
+                dt = _parse_any_date(value)
+                return (1, dt.isoformat()) if dt is not None else (0, value)
+            content = json.dumps({name: row.get(name, "") for name in FIELDS
+                                  if name not in ("matched_keywords", "is_empanelment")},
+                                 sort_keys=True, ensure_ascii=False)
+            return (bool(row.get("corrigendum")), date_rank("published_date"),
+                    date_rank("closing_date"), content)
+        return rank(new) > rank(existing)
 
     async def emit(self, tender: dict[str, Any]) -> None:
         row = {k: _clean(tender.get(k, "")) for k in FIELDS}
         key = (row["source"], row["tender_id"])
+        self.scanned += 1
         # Empanelments are kept only when they match the IT-domain empanelment
         # keyword list (EMPANELMENT_KEYWORDS) — a drug-supply rate contract is
         # dropped, a software-development empanelment is kept. Flag them so the
@@ -346,7 +363,6 @@ class ResultSink:
         if self.matcher is not None:
             hits = self.matcher.match(row["title"], row["description"],
                                       row["organization"])
-            self.scanned += 1
             if not hits and not emp_hits:
                 self.filtered_out += 1
                 self.progress.add_done(1)  # count scanned-but-dropped as progress
@@ -358,28 +374,23 @@ class ResultSink:
                 # preloads-then-accumulates and nothing else deletes rows.
                 async with self._lock:
                     self._rows.pop(key, None)
+                    self._current_rows.pop(key, None)
                 return
             row["matched_keywords"] = "; ".join(hits or emp_hits)
         async with self._lock:
             if not row["tender_id"]:
-                self._errors.append({
+                error = {
                     "source": row["source"], "tender_id": "",
                     "reason": "empty tender_id after parse",
-                })
+                }
+                self._record_error(error)
                 return
-            existing = self._rows.get(key)
+            # The first live observation supersedes yesterday's CSV even if
+            # its deadline was shortened or its title changed without a date.
+            existing = self._current_rows.get(key)
             if existing is None or self._is_newer(row, existing):
                 self._rows[key] = row
-            else:
-                # The kept row may predate a change in the category/keyword
-                # rules (rows carried over from an earlier run's CSV keep
-                # their old values otherwise, since every run preloads then
-                # rewrites). These fields are re-derived from live portal
-                # data on every scan, so refresh them on the row we keep.
-                existing["tender_type"] = row["tender_type"]
-                existing["is_empanelment"] = row["is_empanelment"]
-                if self.matcher is not None:
-                    existing["matched_keywords"] = row["matched_keywords"]
+            self._current_rows[key] = self._rows[key]
             self._since_flush += 1
             self.progress.add_done(1)
             if self._since_flush >= self.config.checkpoint_every:
@@ -387,10 +398,16 @@ class ResultSink:
 
     async def emit_error(self, source: str, tender_id: str, reason: str) -> None:
         async with self._lock:
-            self._errors.append({
+            self._record_error({
                 "source": source, "tender_id": str(tender_id or ""),
                 "reason": reason,
             })
+
+    def _record_error(self, error: dict[str, str]) -> None:
+        self._errors.append(error)
+        self.new_errors.append(error)
+        group = SOURCE_GROUP.get() or error["source"]
+        self.group_errors[group] = self.group_errors.get(group, 0) + 1
 
     # ---- flushing ------------------------------------------------------------
     def _flush_locked(self) -> None:
@@ -536,9 +553,10 @@ def _clean(value: Any) -> str:
 
 def make_session(config: ScraperConfig) -> aiohttp.ClientSession:
     """A shared session: capped connector + default headers."""
-    connector = aiohttp.TCPConnector(limit=config.concurrency, ssl=False)
+    connector = aiohttp.TCPConnector(limit=config.concurrency)
     return aiohttp.ClientSession(
         connector=connector,
+        trust_env=True,
         headers={"User-Agent": DEFAULT_UA,
                  "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8"},
     )

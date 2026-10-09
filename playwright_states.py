@@ -44,21 +44,18 @@ HARD_PAGE_CAP = 500
 
 
 async def _next_enabled(locator) -> bool:
-    try:
-        if await locator.count() == 0:
-            return False
-        handle = await locator.first.element_handle()
-        if handle is None:
-            return False
-        return await handle.evaluate("""el => {
-          const node = el.closest('li, a, button, span') || el;
-          const cls = `${node.className || ''} ${el.className || ''}`.toLowerCase();
-          return !cls.includes('disabled') &&
-                 node.getAttribute('aria-disabled') !== 'true' &&
-                 !node.hasAttribute('disabled');
-        }""")
-    except Exception:  # noqa: BLE001
+    if await locator.count() == 0:
         return False
+    handle = await locator.first.element_handle()
+    if handle is None:
+        return False
+    return await handle.evaluate("""el => {
+      const node = el.closest('li, a, button, span') || el;
+      const cls = `${node.className || ''} ${el.className || ''}`.toLowerCase();
+      return !cls.includes('disabled') &&
+             node.getAttribute('aria-disabled') !== 'true' &&
+             !node.hasAttribute('disabled');
+    }""")
 
 
 # JS run in the page to extract the current table's header + rows. We map by
@@ -213,7 +210,9 @@ async def scrape_tsap(config: ScraperConfig, sink: ResultSink,
                     break
                 await nxt.click()
                 await page.wait_for_timeout(2500)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                await sink.emit_error(cfg["source"], f"page:{pageno}",
+                                      f"pagination failed: {exc!r}")
                 break
             pageno += 1
 
@@ -291,7 +290,9 @@ async def scrape_bpcl(config: ScraperConfig, sink: ResultSink,
                     break
                 await nxt.click()
                 await page.wait_for_timeout(2500)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                await sink.emit_error("bpcl", f"page:{pageno}",
+                                      f"pagination failed: {exc!r}")
                 break
             pageno += 1
         await browser.close()

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 
 import cppp_scraper
@@ -35,7 +36,7 @@ import psu_portals
 import state_gepnic_scraper as gepnic
 import state_portals
 from keywords import KeywordMatcher, load_keywords
-from pipeline import ResultSink, ScraperConfig, make_session
+from pipeline import SOURCE_GROUP, ResultSink, ScraperConfig, make_session
 
 # Anchor the default output dir to this file's location (not the process's
 # CWD), so `outputs/` always lands inside tender_scraper/ regardless of where
@@ -66,14 +67,20 @@ async def _run_group(sink: ResultSink, name: str, coro) -> None:
     guarantees one failure can't take down its siblings.
     """
     print(f"\n=== {name} ===")
+    token = SOURCE_GROUP.set(name)
     try:
         await coro
     except Exception as exc:  # noqa: BLE001
         print(f"[{name}] SOURCE FAILED: {exc!r}")
         await sink.emit_error(name, "", f"source crashed: {exc!r}")
+    finally:
+        errors = sink.group_errors.get(name, 0)
+        sink.source_outcomes[name] = "error" if errors else "ok"
+        logging.getLogger("tender_radar").info("Source %s completed; errors=%d", name, errors)
+        SOURCE_GROUP.reset(token)
 
 
-async def run(args) -> None:
+async def run(args) -> ResultSink | None:
     config = build_config(args)
 
     # Keyword filtering is ON by default; --no-filter disables it.
@@ -153,6 +160,9 @@ async def run(args) -> None:
 
             async def _pw(key: str) -> None:
                 async with browser_sem:
+                    # These connectors previously printed a missing dependency
+                    # then returned, which could look like successful coverage.
+                    from playwright.async_api import async_playwright  # noqa: F401
                     await playwright_states.run_playwright_portal(
                         config, sink, key, args.max_pages)
 
@@ -164,18 +174,21 @@ async def run(args) -> None:
                 groups.append((f"gepnic:{st}", gepnic.scrape_state(
                     session, config, sink, st, args.max_pages)))
 
-        if args.sequential:
-            for name, coro in groups:
-                await _run_group(sink, name, coro)
-        else:
-            await asyncio.gather(*(_run_group(sink, name, coro)
-                                   for name, coro in groups))
+        try:
+            if args.sequential:
+                for name, coro in groups:
+                    await _run_group(sink, name, coro)
+            else:
+                await asyncio.gather(*(_run_group(sink, name, coro)
+                                       for name, coro in groups))
+        finally:
+            await sink.finalize()
+    return sink
 
-        await sink.finalize()
 
-
-def parse_args():
-    p = argparse.ArgumentParser(description="GeM + CPPP + state GePNIC tender scraper")
+def build_parser(*, include_inspection: bool = True):
+    p = argparse.ArgumentParser(description="GeM + CPPP + state GePNIC tender scraper",
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--source",
                    choices=["all", "everything", "gem", "cppp", "states",
                             "psus", "tsap", "playwright", "gepnic", "infralens"],
@@ -192,14 +205,15 @@ def parse_args():
     p.add_argument("--state",
                    help="single portal key for --source states (gujarat|haryana) "
                         "or state name for --source gepnic / --dry-run")
-    p.add_argument("--dry-run", action="store_true",
-                   help="fetch one page of a state and print its structure")
+    if include_inspection:
+        p.add_argument("--dry-run", action="store_true",
+                       help="fetch one page of a state and print its structure")
     p.add_argument("--max-pages", type=int, default=None,
                    help="cap listing pages per source (CPPP full set ~3450 pages)")
     p.add_argument("--no-filter", action="store_true",
                    help="disable keyword filtering (scrape everything)")
     p.add_argument("--keywords-file",
-                   help="file with one keyword per line (default: built-in IT/AI list)")
+                   help="file with one keyword per line (default: built-in AI/infrastructure list)")
     p.add_argument("--gem-pages-per-keyword", type=int, default=2000,
                    help="runaway safety backstop for GeM pages/keyword. Not a real "
                         "limit: we scan only OPEN bids, so keyword sets are small "
@@ -209,9 +223,12 @@ def parse_args():
                    help="polite delay between requests (seconds)")
     p.add_argument("--checkpoint-every", type=int, default=20)
     p.add_argument("--out-dir", default=DEFAULT_OUT_DIR,
-                   help="output directory (default: tender_scraper/outputs, "
-                        "regardless of current working directory)")
-    return p.parse_args()
+                   help="output directory; the default is anchored to the checkout")
+    return p
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 if __name__ == "__main__":

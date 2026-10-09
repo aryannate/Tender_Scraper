@@ -3,6 +3,197 @@
 Async scraper for public Indian government tender listings. No login, no CAPTCHA
 solving — it only touches listing pages that are plainly viewable.
 
+## Daily tender monitoring (Linux / cron)
+
+`python daily_job.py` runs the existing scraper, checks local notification history,
+and sends **one** email containing only **NEW** or meaningfully **UPDATED** matching
+tenders. No changes means no email. It runs once and exits; cron starts it tomorrow.
+The original `run_scraper.py` commands and dashboard remain available.
+
+### Install and configure
+
+Requires Python 3.10+ and a Linux machine with Internet access to the portals and
+your SMTP server. Clone your fork, then run these commands inside its checkout:
+
+```bash
+cd /opt/Tender_Scraper                  # substitute your real checkout path
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m playwright install --with-deps chromium
+# On a machine without package-install permission, ask its administrator to
+# install Playwright's OS dependencies, then use: python -m playwright install chromium
+cp .env.example .env                    # only if you do not already have .env
+chmod 600 .env
+```
+
+Edit `.env` with your SMTP host, sender and recipients. Use `SMTP_PORT=587` with
+`SMTP_SECURITY=starttls`, or `465` with `ssl`. Both modes verify TLS certificates.
+Set `SMTP_USER` and `SMTP_PASSWORD` together for authenticated SMTP (an app password
+may be required by your provider). Both can be blank for an unauthenticated relay.
+`SMTP_SECURITY=none` is for a trusted local test relay only; credentials are never
+sent without TLS. `EMAIL_TO` accepts comma-separated addresses. Real process
+environment variables take precedence over `.env`, which is loaded beside
+`daily_job.py` even when invoked from another directory. Never commit `.env`.
+No SMTP password is stored in the state database or digest.
+
+Chromium is needed for **Telangana, Andhra Pradesh, BPCL and Bihar**. Keep the
+browser installation and cron under the same Unix user. If you override
+`PLAYWRIGHT_BROWSERS_PATH`, use the same value while installing and running.
+The daily default is `--source everything`: every existing HTTP and Playwright
+source is attempted. Missing browsers and failed sources are logged; other
+sources continue. `--source all` retains the old HTTP-only meaning.
+
+### Keywords and manual runs
+
+Edit `KEYWORDS` in `keywords.py`. The default list covers AI / GPU / HPC hardware,
+networking, storage and cloud infrastructure, including H100/H200/B200/B300,
+GB200/GB300, DGX/HGX/NVL72, InfiniBand, Slurm and the other target terms.
+Alternatively, create `keywords.local.txt` with **one keyword per line**, then
+set `KEYWORDS_FILE=keywords.local.txt` in `.env` or pass `--keywords-file`.
+Blank lines and `#` comments are ignored, case-insensitive duplicates are removed,
+and an empty custom list raises a clear error rather than silently restoring defaults.
+Matching is case-insensitive, phrase-aware, word-bounded and accepts spaces/hyphens
+and trailing plurals. Every kept row retains all `matched_keywords`.
+The same custom list applies to empanelments too.
+
+```bash
+# Full scan, preview only: safe before SMTP is configured
+.venv/bin/python daily_job.py --dry-run
+# Inspect outputs/daily/digest.html or digest.txt if there are candidates.
+# Preview runs save observations but NEVER mark them notified.
+
+# One full daily run: sends only new or changed matching tenders
+.venv/bin/python daily_job.py
+# Run again: unchanged successfully notified tenders are suppressed
+.venv/bin/python daily_job.py
+
+# Bounded public-listing smoke test; no mail, separate output/state
+.venv/bin/python daily_job.py --source cppp --max-pages 1 --dry-run --out-dir /tmp/tender-smoke
+# GeM keyword mode has a separate per-keyword limit; --max-pages alone
+# does not cap its keyword searches. Use a small custom keyword file for smoke tests.
+.venv/bin/python daily_job.py --source gem --keywords-file keywords.local.txt --gem-pages-per-keyword 1 --dry-run --out-dir /tmp/tender-gem-smoke
+```
+
+Do not put page limits in the daily cron command: the production default does a
+fresh full scan according to each connector's existing listing/search strategy.
+**Notification state never skips pages or stops source crawling.** GeM's existing
+ongoing-bid keyword searches, source safety caps, public aggregator limitations,
+BHEL live-list stopping rule and the existing published-date cutoff are preserved.
+The old CSV can still contain historical rows, but only tenders actually observed
+in the **current** scan can generate this run's alerts. The packaged dashboard
+sample CSV is not treated as freshly discovered data.
+
+### State, output and failures
+
+Default daily files live in `outputs/daily/`, separate from the packaged dashboard
+CSV. Set `TENDER_OUTPUT_DIR` / `--out-dir` or `TENDER_STATE_DB` / `--state-db` to use
+persistent absolute paths. Relative paths resolve against the command's working
+directory; the cron example below sets that directory explicitly.
+
+- `tenders_gem_cppp.csv`: existing accumulated normalized scraper output.
+- `current_run.csv`: current matching observations only; atomically replaced each run.
+- `tender_state.sqlite3`: source/ID identity, important fields, matched keywords,
+  first/last seen timestamps, fingerprint, last notified fingerprint and timestamp.
+- `digest.html`, `digest.txt`: latest candidate digest preview, also preserved when
+  SMTP configuration or sending fails; removed when the current run has no candidates.
+- `daily_job.log`: console output plus rotating file logging (5 MB, three backups).
+- `errors_log.csv`: existing accumulated fetch/parse errors.
+- `run_summary.json`: current run counts, source outcomes and UTC timestamps.
+
+**NEW** means that `(source, tender_id)` has never been successfully notified.
+**UPDATED** means its title, description, organisation, dates, URL, corrigendum,
+state or exposed tender category differs from the last successfully emailed version.
+Whitespace/case-only prose edits, equivalent date formatting, and keyword-list
+changes alone do not trigger updates. URL path case remains significant.
+Tenders from different sources remain separate even if their reference IDs match.
+Sources that synthesize IDs from titles/URLs retain the original connector's
+identity limitations; a changed synthetic ID can appear as NEW.
+
+Emails use a compact single-column HTML layout plus plain text, list all requested
+fields and matched keywords, and order upcoming closing dates first (unknown dates
+next, already-closed entries last). Explicit UTC dates, including GeM's `Z` dates,
+are interpreted correctly; portal-local dates and the subject's date use
+Asia/Kolkata. Missing shareable detail links fall back to a portal listing where
+you can search the reference ID; protected detail pages are never bypassed.
+
+Scrape observations are committed before SMTP. Notifications are committed only
+once the SMTP server accepts the digest. Missing/invalid SMTP configuration or a
+failed send produces a nonzero exit code, preserves CSV/preview/state, and leaves
+observed matching tenders pending for the next fresh scan. A pending tender is
+retried only when rediscovered as matching in a later scan; notices that close or
+disappear during a mail outage are not sent from historical state alone.
+SMTP is not contacted
+when there are no candidates. All recipients must be accepted before sending the
+message body, so a rejected recipient prevents delivery to the others.
+A process lock next to the SQLite file prevents overlapping daily jobs sharing
+that state from sending duplicate digests. Use the **same state database** for cron
+and manual production runs; deleting it resets notification history. Back it up.
+Do not use an ephemeral filesystem for production state.
+
+As with normal SMTP, a machine crash after the server accepts mail but before the
+local notification commit, or an interrupted connection with an ambiguous DATA
+response, can cause a retry. SMTP and SQLite cannot make that handoff transactional.
+Successful completed runs suppress repeat alerts. SMTP acceptance is not a guarantee
+of inbox delivery; your provider can subsequently bounce mail.
+
+One failing source does not cancel the rest or prevent a digest from successful
+sources. Completion logs report sources attempted/successful, rows scanned (including
+keyword misses and repeated search hits), unique matching tenders, NEW/UPDATED counts,
+digests sent, tenders notified and errors. A source is counted successful when its
+connector completes without reported errors; that count alone does not establish
+portal completeness or live coverage. Errors give exit code `1` even if other sources
+sent their digest; no error or an overlapping job skipped by the lock gives `0`.
+CAPTCHA/auth-gated sources remain skipped/logged under the original public-listing
+rules. Never enable the GePNIC stub's CAPTCHA gate or add CAPTCHA solving.
+
+### Schedule at 07:00 Asia/Kolkata
+
+Install a **user crontab under the same user that installed Chromium** (`crontab -e`).
+Substitute the absolute checkout path and use the virtualenv interpreter directly;
+activation and a permanently running Python process are unnecessary. `.env` loads
+automatically. Create `outputs/daily` first for the redirected log file.
+
+On **Cronie or another cron that supports `CRON_TZ`**:
+
+```cron
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+CRON_TZ=Asia/Kolkata
+0 7 * * * cd /opt/Tender_Scraper && /opt/Tender_Scraper/.venv/bin/python daily_job.py >> /opt/Tender_Scraper/outputs/daily/cron.log 2>&1
+```
+
+**Ubuntu/Debian cron commonly does not support `CRON_TZ` for scheduling.** On a
+host whose system timezone is UTC, use the equivalent **01:30 UTC** entry instead
+(India has no daylight-saving time):
+
+```cron
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+30 1 * * * cd /opt/Tender_Scraper && /opt/Tender_Scraper/.venv/bin/python daily_job.py >> /opt/Tender_Scraper/outputs/daily/cron.log 2>&1
+```
+
+Check the host's timezone with `timedatectl`. If it is already Asia/Kolkata,
+ordinary cron uses `0 7 * * *`. Setting `TZ` in a job changes process time display,
+not necessarily cron's scheduling timezone. Install **only one** of these entries.
+The file logger rotates itself; rotate `cron.log` with the machine's logrotate
+service if retaining cron's duplicate console capture. Scheduling is Linux/cron
+primary; GitHub Actions is not required.
+
+### Tests
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m pip check
+```
+
+Tests cover keywords, fresh-vs-historical output, NEW/UPDATED classification,
+persistence and duplicate suppression, retry after failed mail, HTML rendering,
+SMTP validation and recipient rejection, source failure isolation and overlapping
+runs. The end-to-end test uses the real CPPP parser with local HTTP and SMTP
+servers, fetches every fixture page on all three runs, and verifies NEW → no mail
+→ UPDATED. It sends no external email. Live portal checks are separate and bounded;
+passing tests do not assert that every external source is currently reachable.
+
 ## Setup (fresh Windows machine)
 
 Requires Python 3.10+ (tested on 3.12). In PowerShell or cmd:
@@ -188,7 +379,7 @@ python run_scraper.py --source tsap --state telangana           # single portal
 python run_scraper.py --source tsap --state andhra_pradesh --max-pages 25
 
 # Inspect a state's page structure BEFORE enabling it
-python run_scraper.py --source state --state telangana --dry-run
+python run_scraper.py --source gepnic --state telangana --dry-run
 ```
 
 Key flags: `--max-pages N` (cap pages/source — GeM's full set is ~550k pages!),
@@ -297,7 +488,7 @@ a URL that will fail.
                     "/nicgep/app?page=FrontEndLatestActiveTenders"
                     "&service=direct&session=T&sp=S{page}")
    ```
-2. `python run_scraper.py --source state --state kerala --dry-run` — eyeball the
+2. `python run_scraper.py --source gepnic --state kerala --dry-run` — eyeball the
    printed table/rows. If it shows a CAPTCHA, **stop** (leave it disabled).
 3. If the generic parser fits, set `captcha_confirmed_free=True` for that state,
    then run without `--dry-run`.

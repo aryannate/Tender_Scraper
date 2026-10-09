@@ -24,40 +24,49 @@ import re
 
 # The user's target keyword list (deduplicated, whitespace-trimmed).
 KEYWORDS: list[str] = [
-    "app",
-    "website",
-    "chatbot",
-    "mobile app",
-    "software",
-    "data",
-    "data analytics",
-    "website widgets",
-    "AI-based",
-    "artificial intelligence",
-    "machine learning",
-    "ML-based",
-    "conversational chatbot",
-    "WhatsApp",
-    "telegram",
-    "information tools",
-    "automation",
-    "customer service",
-    "customer support",
-    "dashboard",
-    "agents",
-    "multi lingual chatbots",
-    "voice agents",
-    "OCR",
-    "document data extraction",
-    "document management systems",
-    "vision",
-    "surveillance",
-    "surveillance systems",
-    "object detection",
-    "person detection",
-    "face recognition",
-    "social media agents",
-    "multi agentic systems",
+    "AI",
+    "Artificial Intelligence",
+    "GPU",
+    "GPU Server",
+    "AI Server",
+    "HPC",
+    "High Performance Computing",
+    "Supercomputer",
+    "Compute Cluster",
+    "H100",
+    "H200",
+    "B200",
+    "B300",
+    "GB200",
+    "GB300",
+    "DGX",
+    "HGX",
+    "NVL72",
+    "RTX PRO",
+    "NVIDIA",
+    "CUDA",
+    "InfiniBand",
+    "Spectrum-X",
+    "NVLink",
+    "NVSwitch",
+    "400GbE",
+    "800GbE",
+    "Parallel Storage",
+    "Parallel File System",
+    "Lustre",
+    "BeeGFS",
+    "GPFS",
+    "Slurm",
+    "Kubernetes",
+    "AI Workstation",
+    "Workstation",
+    "Server",
+    "Storage",
+    "HCI",
+    "VDI",
+    "Private Cloud",
+    "Data Center",
+    "Data Centre",
 ]
 
 
@@ -112,6 +121,14 @@ def load_keywords(path: str | None) -> list[str]:
     """Load one keyword per line from a file, or fall back to the built-in list."""
     if not path:
         return KEYWORDS
-    with open(path, encoding="utf-8") as fh:
-        kws = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
-    return kws or KEYWORDS
+    with open(path, encoding="utf-8-sig") as fh:
+        kws = []
+        seen = set()
+        for line in fh:
+            keyword = line.strip()
+            if keyword and not keyword.startswith("#") and keyword.casefold() not in seen:
+                kws.append(keyword)
+                seen.add(keyword.casefold())
+    if not kws:
+        raise ValueError(f"Keyword file contains no keywords: {path}")
+    return kws

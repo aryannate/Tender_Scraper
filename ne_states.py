@@ -88,9 +88,10 @@ async def scrape_daman_diu(session, config: ScraperConfig, sink: ResultSink,
         try:
             html = await fetch(session, "GET", url, config, expect="text")
         except Exception as exc:  # noqa: BLE001
-            if page == 1:
-                await sink.emit_error("daman_diu", "page:1", f"fetch failed: {exc!r}")
-            break  # past the last page WP returns 404 -> stop
+            # Only WordPress's terminal 404 is a normal end-of-list.
+            if page == 1 or getattr(exc.__cause__, "status", None) != 404:
+                await sink.emit_error("daman_diu", f"page:{page}", f"fetch failed: {exc!r}")
+            break
         soup = BeautifulSoup(html, "html.parser")
         table = _find_table(soup, r"End Date")
         if not table:

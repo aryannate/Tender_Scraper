@@ -12,3 +12,18 @@ outputs/.last_refresh
 __pycache__/
 *.pyc
 venv/
+
+# Local runtime, credentials, daily notification history and previews
+.venv/
+.cache/
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.lock
+*.log
+*.log.*
+keywords.local.txt
